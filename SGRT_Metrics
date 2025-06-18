@@ -1,0 +1,126 @@
+import numpy as np
+from scipy.ndimage import generic_filter
+
+# Supporting code for “From Rugged Ridges to Radiotherapy ROIs: Translating Topographical 
+# Metrics to Surface-Guided Radiation Therapy Regions of Interest in Radiotherapy”
+# Author : <CM / SLRON>
+# Date   : <2025-05-20>
+#
+# Input  : elevation grid (2-D NumPy array),   cell size (float, same units
+#            as elevation), optional window size for TPI (odd integer).
+#
+# Output : dict with 2-D arrays (same shape as input) for
+#              - slope_deg: surface gradient in degrees   [0, 90]
+#              - aspect_deg: downslope azimuth in degrees [0, 360)
+#              - vrm: Vector Ruggedness Measure    [0, 1]
+#              - tri: Riley Terrain Ruggedness Index (∑|Δz|)
+#              - tpi: Topographic Position Index   (z − μwindow)
+#
+# * NaNs in the Digital Elevation Model (DEM) are treated as “no-data” and are preserved through all
+#   calculations; neighbourhood metrics with no valid neighbours return NaN.
+
+
+
+def compute_topo_metrics(
+    elev: np.ndarray,
+    cell_size: float,
+    tpi_window: int = 60
+) -> dict[str, np.ndarray]:
+    """
+    Compute classic terrain metrics on a regular elevation grid.
+
+    Parameters
+    ----------
+    elev : (M, N) ndarray
+        Raster DEM with NaNs marking voids / out-of-ROI cells.
+    cell_size : float
+        Grid spacing in same linear units as `elev` (e.g. mm or cm).
+    tpi_window : int, optional
+        Square window size (cells) for the Topographic Position Index
+        moving-average.
+
+    Returns
+    -------
+    metrics : dict[str, ndarray]
+        Keys = 'slope_deg', 'aspect_deg', 'vrm', 'tri', 'tpi'
+
+    Notes
+    -----
+    *  Slope is the zenith angle between the surface normal and the vertical,
+       guaranteed within [0°, 90°] for a DEM (unlike the mesh-normal case).
+    *  Aspect follows GIS convention: 0° = +x (East), increases CCW.
+    *  VRM and TRI use a fixed 3 × 3 neighbourhood window size.
+
+
+    # ------------------------------------------------------------------
+    # 1. First-order derivatives: slope (rad) and aspect (rad)
+    # ------------------------------------------------------------------
+    dz_dx, dz_dy = np.gradient(elev, cell_size, edge_order=2)
+
+    slope_rad  = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))           # 0 … π/2
+    aspect_rad = np.arctan2(-dz_dy, dz_dx)                         # -π … π
+    slope_deg  = np.degrees(slope_rad)
+    aspect_deg = (np.degrees(aspect_rad) + 360) % 360              # 0 … 360
+
+    # ------------------------------------------------------------------
+    # 2. Vector Ruggedness Measure (VRM)  (Sappington JM et al., 2007)
+    # ------------------------------------------------------------------
+    # Local surface normals from slope / aspect (unit vectors)
+    nx = np.sin(slope_rad) * np.cos(aspect_rad)
+    ny = np.sin(slope_rad) * np.sin(aspect_rad)
+    nz = np.cos(slope_rad)
+
+    vrm = np.full_like(elev, np.nan, dtype=float)
+
+    for i in range(elev.shape[0]):
+        for j in range(elev.shape[1]):
+            i0, i1 = max(i-1, 0), min(i+2, elev.shape[0])
+            j0, j1 = max(j-1, 0), min(j+2, elev.shape[1])
+
+            n_stack = np.vstack((
+                nx[i0:i1, j0:j1].ravel(),
+                ny[i0:i1, j0:j1].ravel(),
+                nz[i0:i1, j0:j1].ravel()
+            ))
+
+            valid = np.all(~np.isnan(n_stack), axis=0)
+            if not np.any(valid):
+                continue
+
+            Sx, Sy, Sz = np.nansum(n_stack[:, valid], axis=1)
+            R = np.sqrt(Sx**2 + Sy**2 + Sz**2)
+            vrm[i, j] = 1.0 - R / valid.sum()
+
+    # ------------------------------------------------------------------
+    # 3. Terrain Ruggedness Index (TRI) (Riley et al., 1999)
+    # ------------------------------------------------------------------
+    def _tri(window: np.ndarray) -> float:
+        centre = window[len(window) // 2]
+        diffs  = np.abs(window - centre)
+        diffs  = diffs[~np.isnan(diffs)]
+        return np.sum(diffs) if diffs.size else np.nan
+
+    tri = generic_filter(
+        elev, function=_tri, size=3,
+        mode='constant', cval=np.nan
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Topographic Position Index (TPI) (D. Weiss et al., 2001, De Reu J et al., 2013)
+    # ------------------------------------------------------------------
+    local_mean = generic_filter(
+        elev, np.nanmean, size=tpi_window,
+        mode='constant', cval=np.nan
+    )
+    tpi = elev - local_mean
+
+    # ------------------------------------------------------------------
+    # 5. Results
+    # ------------------------------------------------------------------
+    return {
+        'slope_deg' : slope_deg,
+        'aspect_deg': aspect_deg,
+        'vrm'       : vrm,
+        'tri'       : tri,
+        'tpi'       : tpi
+    }
